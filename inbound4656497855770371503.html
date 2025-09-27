@@ -1,0 +1,663 @@
+import logging
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from datetime import datetime, timedelta
+import os
+
+# Configuration
+BOT_TOKEN = "8285304956:AAHLwTbnw2rPLdfPYj9237gIXShd9tFdFF4"
+ADMIN_IDS = [123456789]  # Your Telegram ID
+
+# Updated VIP Plans configuration
+VIP_PLANS = {
+    1: {"price": 5, "days": 10, "daily_return": 1, "recharge_bonus": 1, "total_return": 11},
+    2: {"price": 10, "days": 10, "daily_return": 2, "recharge_bonus": 2, "total_return": 22},
+    3: {"price": 15, "days": 10, "daily_return": 3, "recharge_bonus": 3, "total_return": 33},
+    4: {"price": 20, "days": 10, "daily_return": 4, "recharge_bonus": 4, "total_return": 44},
+    5: {"price": 30, "days": 10, "daily_return": 6, "recharge_bonus": 5, "total_return": 65}
+}
+
+class AstraProfitHubBot:
+    def __init__(self):
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize database with activity tracking"""
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        
+        # Users table with activity tracking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                balance REAL DEFAULT 0.0,
+                vip_level INTEGER DEFAULT 0,
+                vip_expiry DATE,
+                total_deposited REAL DEFAULT 0.0,
+                total_earned REAL DEFAULT 0.0,
+                consecutive_active_days INTEGER DEFAULT 0,
+                last_active_date DATE,
+                daily_bonus_claimed DATE,
+                referral_code TEXT,
+                referred_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Activity log table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                activity_type TEXT,
+                date DATE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Payments table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                vip_level INTEGER,
+                tx_hash TEXT UNIQUE,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Transactions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                type TEXT,
+                description TEXT,
+                status TEXT DEFAULT 'completed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logging.info("Database initialized with activity tracking")
+
+    def update_user_activity(self, user_id):
+        """Update user activity and consecutive active days"""
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        today = datetime.now().date()
+        
+        cursor.execute('SELECT last_active_date, consecutive_active_days FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        
+        if result:
+            last_active, current_streak = result
+            if last_active:
+                last_active = datetime.strptime(last_active, '%Y-%m-%d').date()
+                days_diff = (today - last_active).days
+                
+                if days_diff == 1:  # Consecutive day
+                    new_streak = current_streak + 1
+                elif days_diff == 0:  # Same day
+                    new_streak = current_streak
+                else:  # Broken streak
+                    new_streak = 1
+            else:
+                new_streak = 1
+        else:
+            new_streak = 1
+        
+        # Update user activity
+        cursor.execute('''
+            UPDATE users 
+            SET last_active_date = ?, consecutive_active_days = ?
+            WHERE user_id = ?
+        ''', (today, new_streak, user_id))
+        
+        # Log activity
+        cursor.execute('''
+            INSERT INTO activity_log (user_id, activity_type, date)
+            VALUES (?, ?, ?)
+        ''', (user_id, 'login', today))
+        
+        conn.commit()
+        conn.close()
+        return new_streak
+
+    def can_withdraw(self, user_id):
+        """Check if user meets withdrawal requirements"""
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT balance, consecutive_active_days FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            balance, active_days = result
+            return balance >= 5 and active_days >= 5
+        return False
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command with activity tracking"""
+        user = update.effective_user
+        user_id = user.id
+        
+        # Check if user was referred
+        referral_id = None
+        if context.args:
+            try:
+                referral_id = int(context.args[0])
+            except ValueError:
+                referral_id = None
+        
+        # Update user activity
+        active_days = self.update_user_activity(user_id)
+        
+        # Save user to database
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR IGNORE INTO users (user_id, username, first_name, referred_by) 
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, user.username, user.first_name, referral_id))
+        
+        # If this is a new user and was referred, process referral
+        if cursor.rowcount == 1 and referral_id:
+            cursor.execute('''
+                INSERT INTO referrals (referrer_id, referred_id, level) 
+                VALUES (?, ?, 1)
+            ''', (referral_id, user_id))
+            
+            # Add referral bonus to referrer
+            cursor.execute('''
+                UPDATE users SET balance = balance + 0.5 
+                WHERE user_id = ?
+            ''', (referral_id,))
+            
+            cursor.execute('''
+                INSERT INTO transactions (user_id, amount, type, description, status)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (referral_id, 0.5, 'referral', 'Referral bonus', 'completed'))
+        
+        conn.commit()
+        conn.close()
+        
+        # Welcome message
+        keyboard = [
+            [InlineKeyboardButton("💰 VIP Plans", callback_data="vip_plans")],
+            [InlineKeyboardButton("💳 Withdraw", callback_data="withdraw")],
+            [InlineKeyboardButton("👥 Referral Program", callback_data="referral")],
+            [InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily_bonus")],
+            [InlineKeyboardButton("📊 My Account", callback_data="my_account")],
+            [InlineKeyboardButton("🆘 Support", callback_data="support")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        welcome_text = f"""
+👋 Welcome to *Astra ProfitHub*, {user.first_name}!
+
+📊 *Your Activity Stats:*
+• Consecutive Active Days: {active_days}/5
+• Withdrawal Eligible: {'✅' if active_days >= 5 else '❌'}
+
+💫 *Withdrawal Requirements:*
+• Minimum $5 balance
+• 5 consecutive active days
+
+Start your investment journey today!"""
+
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def vip_plans(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show updated VIP plans"""
+        query = update.callback_query
+        await query.answer()
+        
+        vip_text = """
+💰 *VIP Investment Plans - Updated Returns!*
+
+*VIP 1* - $5 Investment (10 days)
+• Daily Return: $1 USD
+• Recharge Bonus: $1 USD
+• Total Return: $11 USD
+
+*VIP 2* - $10 Investment (10 days)  
+• Daily Return: $2 USD
+• Recharge Bonus: $2 USD
+• Total Return: $22 USD
+
+*VIP 3* - $15 Investment (10 days)
+• Daily Return: $3 USD
+• Recharge Bonus: $3 USD
+• Total Return: $33 USD
+
+*VIP 4* - $20 Investment (10 days)
+• Daily Return: $4 USD
+• Recharge Bonus: $4 USD
+• Total Return: $44 USD
+
+*VIP 5* - $30 Investment (10 days)
+• Daily Return: $6 USD
+• Recharge Bonus: $5 USD
+• Total Return: $65 USD
+
+🎯 *All plans include:*
+• Daily returns for 10 days
+• Instant recharge bonus
+• Priority support"""
+
+        keyboard = [
+            [InlineKeyboardButton("💳 Deposit Wallet", callback_data="deposit_wallet")],
+            [InlineKeyboardButton("📊 My Account", callback_data="my_account")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            vip_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def deposit_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show deposit wallet information"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        wallet_text = f"""
+💰 *Deposit Wallet Information*
+
+*Network:* BEP-20 (Binance Smart Chain)
+*Token:* USDT
+*Address:* 
+```
+0x41ef699B7C10C04a6f7c47D0AB0f19CA8398583a
+```
+
+*Your User ID:* `{user_id}`
+
+⚠️ *Important:*
+• Send exact plan amount
+• Include your User ID in memo: `{user_id}`
+• Forward payment proof to @AstraSupport"""
+
+        keyboard = [
+            [InlineKeyboardButton("📊 VIP Plans", callback_data="vip_plans")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            wallet_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def referral_program(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show referral program"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        bot_username = context.bot.username
+        referral_link = f"https://t.me/{bot_username}?start={user_id}"
+        referral_code = f"ASTRA{user_id}"
+        
+        # Get referral stats
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT COUNT(*) FROM referrals WHERE referrer_id = ?
+        ''', (user_id,))
+        total_referrals = cursor.fetchone()[0]
+        
+        cursor.execute('''
+            SELECT COUNT(DISTINCT r.referred_id) 
+            FROM referrals r 
+            JOIN users u ON r.referred_id = u.user_id 
+            WHERE r.referrer_id = ? AND u.vip_level > 0
+        ''', (user_id,))
+        vip_referrals = cursor.fetchone()[0]
+        
+        cursor.execute('''
+            SELECT COALESCE(SUM(amount), 0) 
+            FROM transactions 
+            WHERE user_id = ? AND type = 'referral' AND status = 'completed'
+        ''', (user_id,))
+        referral_earnings = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        referral_text = f"""
+👥 *Referral Program*
+
+Earn $0.5 for each friend who joins!
+
+*Your Referral Link:*
+`{referral_link}`
+
+*Your Referral Code:* `{referral_code}`
+
+💰 *Commission Structure:*
+• Level 1: $0.5 per direct referral
+• Level 2: $0.2 per indirect referral  
+• Level 3: $0.1 per second indirect
+
+📋 *Withdrawal Conditions:*
+• Minimum $10 to withdraw referral earnings
+• 5+ referrals must purchase VIP plans
+
+📊 *Your Referral Stats:*
+• Total Referrals: {total_referrals}
+• Active VIP Referrals: {vip_referrals}
+• Total Earnings: ${referral_earnings:.2f}"""
+
+        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            referral_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def daily_bonus(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle daily bonus claim with activity tracking"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        today = datetime.now().date()
+        
+        # Update activity first
+        active_days = self.update_user_activity(user_id)
+        
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT daily_bonus_claimed FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        
+        bonus_amount = 0.1  # $0.1 daily bonus
+        
+        if result and result[0] == str(today):
+            bonus_text = "❌ You've already claimed your daily bonus today. Come back tomorrow!"
+        else:
+            # Update bonus claim and add balance
+            cursor.execute('''
+                UPDATE users 
+                SET balance = balance + ?, daily_bonus_claimed = ? 
+                WHERE user_id = ?
+            ''', (bonus_amount, today, user_id))
+            
+            # Record transaction
+            cursor.execute('''
+                INSERT INTO transactions (user_id, amount, type, description, status)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, bonus_amount, 'bonus', 'Daily sign-in bonus', 'completed'))
+            
+            conn.commit()
+            bonus_text = f"""
+🎉 *Daily Bonus Claimed!*
+
+💰 Bonus: ${bonus_amount} added to your balance
+📅 Active streak: {active_days} consecutive days
+🎯 Withdrawal requirement: {active_days}/5 days
+
+Keep coming daily to maintain your streak!"""
+        
+        conn.close()
+        
+        keyboard = [[InlineKeyboardButton("📊 My Account", callback_data="my_account")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            bonus_text,
+            reply_markup=reply_markup
+        )
+
+    async def my_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user account with activity information"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        
+        # Update activity
+        active_days = self.update_user_activity(user_id)
+        
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT balance, vip_level, total_deposited, total_earned, consecutive_active_days 
+            FROM users WHERE user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            balance, vip_level, deposited, earned, active_days = result
+            can_withdraw = self.can_withdraw(user_id)
+            
+            account_text = f"""
+📊 *Your Account Overview*
+
+👤 *User ID:* `{user_id}`
+💰 *Balance:* ${balance:.2f}
+⭐ *VIP Level:* {vip_level if vip_level > 0 else 'None'}
+📅 *Active Days:* {active_days}/5
+💳 *Withdrawal Status:* {'✅ Eligible' if can_withdraw else '❌ Not Eligible'}
+
+📈 *Earnings Summary:*
+• Total Deposited: ${deposited:.2f}
+• Total Earned: ${earned:.2f}
+
+🎯 *Quick Actions:*
+• Claim daily bonus to maintain streak
+• Upgrade VIP for higher returns
+• Refer friends for extra income"""
+
+        keyboard = [
+            [InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily_bonus")],
+            [InlineKeyboardButton("💳 Withdraw", callback_data="withdraw")],
+            [InlineKeyboardButton("💰 VIP Plans", callback_data="vip_plans")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            account_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def withdraw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle withdrawal requests with activity check"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT balance, consecutive_active_days FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            balance, active_days = result
+        else:
+            balance, active_days = 0, 0
+        
+        can_withdraw = self.can_withdraw(user_id)
+        
+        if not can_withdraw:
+            withdraw_text = f"""
+❌ *Withdrawal Requirements Not Met*
+
+📋 *Current Status:*
+• Your Balance: ${balance:.2f}
+• Consecutive Active Days: {active_days}/5
+• Eligibility: {'✅ Ready' if can_withdraw else '❌ Not Ready'}
+
+⚡ *Requirements for Withdrawal:*
+1. Minimum balance: $5.00
+2. 5 consecutive active days of signing in
+
+💡 *Tips to qualify:*
+• Claim daily bonus every day
+• Check the bot regularly
+• Complete your 5-day streak"""
+
+        else:
+            withdraw_text = f"""
+✅ *Withdrawal Available!*
+
+💰 *Available Balance:* ${balance:.2f}
+📅 *Active Days:* {active_days}/5 ✅
+
+💳 *Withdrawal Process:*
+1. Minimum withdrawal: $5.00
+2. Processing time: 24-48 hours
+3. Zero withdrawal fees
+
+📋 *To withdraw, contact @AstraSupport with:*
+- Your User ID: `{user_id}`
+- Withdrawal amount
+- Your USDT wallet address (BEP-20)"""
+
+        keyboard = [
+            [InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily_bonus")],
+            [InlineKeyboardButton("📊 My Account", callback_data="my_account")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            withdraw_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def support(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show support information"""
+        query = update.callback_query
+        await query.answer()
+        
+        support_text = """
+🆘 *Customer Support*
+
+*Need help? Contact our support team:*
+
+👤 *Telegram:* @AstraSupport
+📧 *Email:* support@astraprofithub.com
+
+🕒 *Response Time:*
+• General inquiries: 6-12 hours
+• VIP members: 2-6 hours
+• Urgent issues: 1-3 hours
+
+💡 *Before contacting support:*
+1. Check FAQ in main menu
+2. Have your User ID ready
+3. Describe issue clearly"""
+
+        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            support_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Return to main menu"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        conn = sqlite3.connect('astra_bot.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        balance = result[0] if result else 0.0
+        conn.close()
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 VIP Plans", callback_data="vip_plans")],
+            [InlineKeyboardButton("💳 Withdraw", callback_data="withdraw")],
+            [InlineKeyboardButton("👥 Referral Program", callback_data="referral")],
+            [InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily_bonus")],
+            [InlineKeyboardButton("📊 My Account", callback_data="my_account")],
+            [InlineKeyboardButton("🆘 Support", callback_data="support")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        menu_text = f"""
+🏠 *Main Menu* - Astra ProfitHub
+
+*Your Balance:* ${balance:.2f}
+
+Choose an option below:"""
+        
+        await query.edit_message_text(
+            menu_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors"""
+        logging.error(f"Exception while handling an update: {context.error}")
+
+# Main function
+def main():
+    """Start the bot"""
+    # Initialize database
+    bot = AstraProfitHubBot()
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CallbackQueryHandler(bot.vip_plans, pattern="^vip_plans$"))
+    application.add_handler(CallbackQueryHandler(bot.deposit_wallet, pattern="^deposit_wallet$"))
+    application.add_handler(CallbackQueryHandler(bot.referral_program, pattern="^referral$"))
+    application.add_handler(CallbackQueryHandler(bot.daily_bonus, pattern="^daily_bonus$"))
+    application.add_handler(CallbackQueryHandler(bot.my_account, pattern="^my_account$"))
+    application.add_handler(CallbackQueryHandler(bot.withdraw, pattern="^withdraw$"))
+    application.add_handler(CallbackQueryHandler(bot.support, pattern="^support$"))
+    application.add_handler(CallbackQueryHandler(bot.main_menu, pattern="^main_menu$"))
+    
+    # Add error handler
+    application.add_error_handler(bot.error_handler)
+    
+    # Start bot
+    print("🤖 Astra ProfitHub Bot is running...")
+    print("✅ Database initialized")
+    print("✅ VIP Plans: Updated with new returns")
+    print("✅ Withdrawal: 5-day activity requirement enabled")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
+```
+
